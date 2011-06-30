@@ -1,6 +1,6 @@
 =begin
   ActiveSalesforce
-  Copyright 2006 Doug Chasman
+  Copyright 2006 Doug Chasman, 2011 Albert Davidson Chou
  
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -53,8 +53,24 @@ module ActiveSalesforce
         super(connection, :update, sobject)
       end
     end
-  
-  
+
+
+    class Upsert < Base
+      attr_reader :external_id_field_name
+
+      def initialize( connection, sobject, external_id_field_name, idproxy )
+        super( connection, :upsert, sobject )
+        @external_id_field_name = external_id_field_name
+        @idproxy = idproxy
+      end
+
+      def after_execute(result)
+        id = result[:id]
+        @idproxy << id if id
+      end
+    end
+
+
     class Delete < Base
       def initialize(connection, ids)
         super(connection, :delete, ids)

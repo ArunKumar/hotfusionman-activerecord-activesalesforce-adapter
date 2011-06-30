@@ -74,7 +74,7 @@ module ActiveRecord
       end
 
       # Check to insure that the second to last path component is a 'u' for Partner API
-      raise ActiveSalesforce::ASFError.new(logger, "Invalid salesforce server url '#{url}', must be a valid Parter API URL") unless url.match(/\/u\//mi)
+      raise ActiveSalesforce::ASFError.new(logger, "Invalid Salesforce.com server URL '#{url}', must be a valid Partner API URL") unless url.match(/\/u\//mi)
       
       if sid
         binding = @@cache["sid=#{sid}"] unless binding
@@ -109,6 +109,47 @@ module ActiveRecord
       ConnectionAdapters::SalesforceAdapter.new(binding, logger, config)
 
     end
+
+
+    alias :original_save :save
+    def save( perform_validation = TRUE, external_id_field_name = nil )
+      unless external_id_field_name
+        original_save( perform_validation )
+      else
+        upsert( external_id_field_name, perform_validation )
+      end
+    end
+
+    alias :original_save! :save!
+    def save!( external_id_field_name = nil )
+      unless external_id_field_name
+        original_save!
+      else
+        upsert!( external_id_field_name )
+      end
+    end
+
+
+    def upsert( external_id_field_name, perform_validation = TRUE )
+      quoted_attributes = attributes_with_quotes
+
+      statement = if quoted_attributes.empty?
+                    connection.empty_insert_statement(self.class.table_name)
+                  else
+                    "INSERT INTO #{self.class.quoted_table_name} " +
+                        "(#{quoted_column_names.join(', ')}) " +
+                        "VALUES(#{quoted_attributes.values.join(', ')})"
+                  end
+
+      self.id = connection.upsert( statement, external_id_field_name, "#{self.class.name} Upsert", self.class.primary_key, self.id, self.class.sequence_name )
+
+      @new_record = false
+      id
+    end
+
+    def upsert!( external_id_field_name )
+      upsert( external_id_field_name ) || raise( RecordNotSaved )
+    end
   end
   
   
@@ -118,7 +159,8 @@ module ActiveRecord
       include StringHelper
       
       MAX_BOXCAR_SIZE = 200
-      
+      EXTERNAL_ID_FIELD_NAME_IDENTIFIER = 'externalIdFieldName'
+
       attr_accessor :batch_size
       attr_reader :entity_def_map, :keyprefix_to_entity_def_map, :config, :class_to_entity_map
       
@@ -211,45 +253,49 @@ module ActiveRecord
         log('Opening boxcar', 'begin_db_transaction()')
         @command_boxcar = []
       end
-      
-      
+
+
       def send_commands(commands)
         # Send the boxcar'ed command set
         verb = commands[0].verb
-        
+
         args = []
-        commands.each do |command| 
+        commands.each do |command|
           command.args.each { |arg| args << arg }
         end
-        
-        response = @connection.send(verb, args)
-        
+
+        unless verb == :upsert
+          response = @connection.send(verb, args)
+        else
+          response = @connection.send( verb, args.unshift( EXTERNAL_ID_FIELD_NAME_IDENTIFIER, commands[0].external_id_field_name ) )
+        end
+
         result = get_result(response, verb)
-        
+
         result = [ result ] unless result.is_a?(Array)
-        
+
         errors = []
         result.each_with_index do |r, n|
           success = r[:success] == "true"
-          
-          # Give each command a chance to process its own result
+
+            # Give each command a chance to process its own result
           command = commands[n]
           command.after_execute(r)
-          
-          # Handle the set of failures
+
+            # Handle the set of failures
           errors << r[:errors] unless r[:success] == "true"
         end
-        
+
         unless errors.empty?
           message = errors.join("\n")
           fault = (errors.map { |error| error[:message] }).join("\n")
-          raise ActiveSalesforce::ASFError.new(@logger, message, fault) 
+          raise ActiveSalesforce::ASFError.new(@logger, message, fault)
         end
-        
+
         result
       end
-      
-       
+
+
       # Commits the transaction (and turns on auto-committing).
       def commit_db_transaction()   
         log("Committing boxcar with #{@command_boxcar.length} commands", 'commit_db_transaction()')
@@ -439,7 +485,7 @@ module ActiveRecord
           values.map! { |v| v.first == "'" ? v.slice(1, v.length - 2) : v == "NULL" ? nil : v }
           
           fields = get_fields(columns, names, values, :updateable)
-		      null_fields = get_null_fields(columns, names, values, :updateable)          
+          null_fields = get_null_fields(columns, names, values, :updateable)
           
           ids = sql.match(/WHERE\s+id\s*=\s*'(\w+)'/mi)
           return if ids.nil?
@@ -452,7 +498,36 @@ module ActiveRecord
       end
       
       
-      def delete(sql, name = nil) 
+      def upsert( sql, external_id_field_name, name = nil, pk = nil, id_value = nil, sequence_name = nil )
+        log(sql, name) {
+          # Convert sql to sobject
+          table_name, columns, entity_def = lookup(sql.match(/INSERT\s+INTO\s+(\w+)\s+/mi)[1])
+          columns = entity_def.column_name_to_column
+
+          # Extract array of column names
+          names = sql.match(/\((.+)\)\s+VALUES/mi)[1].scan(/\w+/mi)
+
+          # Extract arrays of values
+          values = sql.match(/VALUES\s*\((.+)\)/mi)[1]
+          values = values.scan(/(NULL|TRUE|FALSE|'(?:(?:[^']|'')*)'),*/mi).flatten
+          values.map! { |v| v.first == "'" ? v.slice(1, v.length - 2) : v == "NULL" ? nil : v }
+
+          fields = get_fields(columns, names, values, :createable)
+          fields.merge( get_fields( columns, names, values, :updateable ) )
+          null_fields = get_null_fields(columns, names, values, :updateable)
+
+          sobject = create_sobject( entity_def.api_name, nil, fields, null_fields )
+
+          # Track the id to be able to update it if/when the create() is actually executed
+          id = String.new
+          queue_command ActiveSalesforce::BoxcarCommand::Upsert.new( self, sobject, external_id_field_name, id )
+
+          id
+        }
+      end
+
+
+      def delete(sql, name = nil)
         log(sql, name) {
           # Extract the id
           match = sql.match(/WHERE\s+id\s*=\s*'(\w+)'/mi)
